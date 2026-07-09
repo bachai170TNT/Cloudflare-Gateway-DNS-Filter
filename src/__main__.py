@@ -5,6 +5,7 @@ from src.cloudflare import (
     create_list, update_list, create_rule,
     update_rule, delete_list, delete_rule
 )
+from src.requests import NotFoundException
 
 # Cloudflare Gateway free tier hard limit for number of lists
 MAX_TOTAL_LISTS = 300
@@ -67,13 +68,29 @@ class CloudflareManager:
                     remaining_domains.difference_update(new_items)
 
                 if remove_items or new_items:
-                    update_list(list_id, remove_items, new_items)
-                    info(
-                        f"Updated list: {list_name} "
-                        f"| Added {len(new_items)}, Removed {len(remove_items)} "
-                        f"| Total: {len(chunk)}"
-                    )
-                    self.cache["mapping"][list_id] = list(chunk)
+                    try:
+                        update_list(list_id, remove_items, new_items)
+                        info(
+                            f"Updated list: {list_name} "
+                            f"| Added {len(new_items)}, Removed {len(remove_items)} "
+                            f"| Total: {len(chunk)}"
+                        )
+                        self.cache["mapping"][list_id] = list(chunk)
+                    except NotFoundException:
+                        # Cache is stale: this list was deleted outside the
+                        # script (e.g. manually on the dashboard). Evict it
+                        # and recreate from scratch instead of failing the run.
+                        silent_error(
+                            f"List {list_name} ({list_id}) missing on Cloudflare "
+                            f"— evicting from cache and recreating"
+                        )
+                        self.cache["lists"] = [l for l in self.cache["lists"] if l["id"] != list_id]
+                        self.cache["mapping"].pop(list_id, None)
+                        lst = create_list(list_name, list(chunk))
+                        info(f"Recreated list: {lst['name']} with {len(chunk)} domains")
+                        self.cache["lists"].append(lst)
+                        self.cache["mapping"][lst["id"]] = list(chunk)
+                        list_id = lst["id"]
                 else:
                     silent_error(f"Skipped (no changes): {list_name} | Total: {len(chunk)}")
 
@@ -97,13 +114,26 @@ class CloudflareManager:
 
         if cgp_rule:
             if set(new_list_ids) != cgp_list_ids:
-                updated = update_rule(rule_name, cgp_rule["id"], new_list_ids,
-                                      action=rule_action, priority=rule_priority)
-                info(f"Updated rule: {updated['name']}")
-                self.cache["rules"] = [
-                    r for r in self.cache["rules"] if r["id"] != cgp_rule["id"]
-                ]
-                self.cache["rules"].append(updated)
+                try:
+                    updated = update_rule(rule_name, cgp_rule["id"], new_list_ids,
+                                          action=rule_action, priority=rule_priority)
+                    info(f"Updated rule: {updated['name']}")
+                    self.cache["rules"] = [
+                        r for r in self.cache["rules"] if r["id"] != cgp_rule["id"]
+                    ]
+                    self.cache["rules"].append(updated)
+                except NotFoundException:
+                    silent_error(
+                        f"Rule {rule_name} ({cgp_rule['id']}) missing on Cloudflare "
+                        f"— evicting from cache and recreating"
+                    )
+                    self.cache["rules"] = [
+                        r for r in self.cache["rules"] if r["id"] != cgp_rule["id"]
+                    ]
+                    rule = create_rule(rule_name, new_list_ids,
+                                       action=rule_action, priority=rule_priority)
+                    info(f"Recreated rule: {rule['name']}")
+                    self.cache["rules"].append(rule)
             else:
                 silent_error(f"Skipping rule update (unchanged): {rule_name}")
         else:
@@ -121,14 +151,20 @@ class CloudflareManager:
         current_lists.sort(key=utils.safe_sort_key)
 
         for rule in current_rules:
-            delete_rule(rule["id"])
-            info(f"Deleted rule: {rule['name']}")
+            try:
+                delete_rule(rule["id"])
+                info(f"Deleted rule: {rule['name']}")
+            except NotFoundException:
+                silent_error(f"Rule {rule['name']} already gone on Cloudflare — skipping")
             self.cache["rules"] = [r for r in self.cache["rules"] if r["id"] != rule["id"]]
             utils.save_cache(self.cache)
 
         for lst in current_lists:
-            delete_list(lst["id"])
-            info(f"Deleted list: {lst['name']}")
+            try:
+                delete_list(lst["id"])
+                info(f"Deleted list: {lst['name']}")
+            except NotFoundException:
+                silent_error(f"List {lst['name']} already gone on Cloudflare — skipping")
             self.cache["lists"] = [l for l in self.cache["lists"] if l["id"] != lst["id"]]
             if lst["id"] in self.cache["mapping"]:
                 del self.cache["mapping"][lst["id"]]

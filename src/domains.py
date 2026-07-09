@@ -34,45 +34,54 @@ class BaseDomainConverter:
         return urls
 
     @retry(**retry_config)
-    def download_file(self, url):
-        parsed_url = urlparse(url)
-        if parsed_url.scheme == "https":
-            conn = http.client.HTTPSConnection(parsed_url.netloc)
-        else:
-            conn = http.client.HTTPConnection(parsed_url.netloc)
-
+    def download_file(self, url, timeout: int = 15, max_redirects: int = 5):
         headers = {"User-Agent": "Mozilla/5.0"}
-        conn.request("GET", parsed_url.path, headers=headers)
-        response = conn.getresponse()
+        redirects = 0
 
-        while response.status in (301, 302, 303, 307, 308):
-            location = response.getheader("Location")
-            if not location:
-                break
-            if not urlparse(location).netloc:
-                location = urljoin(url, location)
-            url = location
+        while True:
             parsed_url = urlparse(url)
+            path = parsed_url.path or "/"
+            if parsed_url.query:
+                path += f"?{parsed_url.query}"
+
             if parsed_url.scheme == "https":
-                conn = http.client.HTTPSConnection(parsed_url.netloc)
+                conn = http.client.HTTPSConnection(parsed_url.netloc, timeout=timeout)
             else:
-                conn = http.client.HTTPConnection(parsed_url.netloc)
-            conn.request("GET", parsed_url.path, headers=headers)
-            response = conn.getresponse()
+                conn = http.client.HTTPConnection(parsed_url.netloc, timeout=timeout)
 
-        if response.status != 200:
-            error_message = f"Failed to download file from {url}, status code: {response.status}"
-            silent_error(error_message)
-            conn.close()
-            if response.status == 429:
-                raise RateLimitException(error_message)
-            else:
-                raise HTTPException(error_message)
+            try:
+                conn.request("GET", path, headers=headers)
+                response = conn.getresponse()
 
-        data = response.read().decode("utf-8")
-        conn.close()
-        info(f"Downloaded file from {url}. File size: {len(data)}")
-        return data
+                if response.status in (301, 302, 303, 307, 308):
+                    location = response.getheader("Location")
+                    response.read()  # drain body before closing/reusing
+                    if not location:
+                        break
+                    redirects += 1
+                    if redirects > max_redirects:
+                        error_message = f"Too many redirects ({redirects}) while downloading {url}"
+                        silent_error(error_message)
+                        raise HTTPException(error_message)
+                    if not urlparse(location).netloc:
+                        location = urljoin(url, location)
+                    url = location
+                    continue
+
+                if response.status != 200:
+                    error_message = f"Failed to download file from {url}, status code: {response.status}"
+                    silent_error(error_message)
+                    if response.status == 429:
+                        raise RateLimitException(error_message)
+                    else:
+                        raise HTTPException(error_message)
+
+                data = response.read().decode("utf-8")
+                info(f"Downloaded file from {url}. File size: {len(data)}")
+                return data
+            finally:
+                conn.close()
+
 
 
 class BlockDomainConverter(BaseDomainConverter):
