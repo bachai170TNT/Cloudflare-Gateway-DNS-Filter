@@ -1,6 +1,6 @@
 import argparse
 from src.domains import BlockDomainConverter, AllowDomainConverter
-from src import utils, info, silent_error, error, BLOCK_PREFIX, ALLOW_PREFIX
+from src import utils, info, silent_error, error, BLOCK_PREFIX, ALLOW_PREFIX, ENABLE_SNI_FILTER
 from src.cloudflare import (
     create_list, update_list, create_rule,
     update_rule, delete_list, delete_rule
@@ -18,6 +18,7 @@ class CloudflareManager:
         # Block config
         self.block_list_name = f"[{BLOCK_PREFIX}]"
         self.block_rule_name = f"[{BLOCK_PREFIX}] Block Ads"
+        self.block_sni_rule_name = f"[{BLOCK_PREFIX}] Block Ads (SNI)"
 
         # Allow config
         self.allow_list_name = f"[{ALLOW_PREFIX}]"
@@ -26,9 +27,61 @@ class CloudflareManager:
     # ------------------------------------------------------------------
     # Generic list/rule sync (shared by both block and allow)
     # ------------------------------------------------------------------
-    def _sync_lists(self, domains, list_name_prefix, rule_name, rule_action, rule_priority):
-        current_lists = utils.get_current_lists(self.cache, list_name_prefix)
+    def _sync_rule(self, list_ids, rule_name, rule_action, rule_priority,
+                    filters=None, traffic_field="dns.domains"):
         current_rules = utils.get_current_rules(self.cache, rule_name)
+        cgp_rule = next((r for r in current_rules if r["name"] == rule_name), None)
+        cgp_list_ids = utils.extract_list_ids(cgp_rule)
+
+        if cgp_rule:
+            if set(list_ids) != cgp_list_ids:
+                try:
+                    updated = update_rule(rule_name, cgp_rule["id"], list_ids,
+                                          action=rule_action, priority=rule_priority,
+                                          filters=filters, traffic_field=traffic_field)
+                    info(f"Updated rule: {updated['name']}")
+                    self.cache["rules"] = [
+                        r for r in self.cache["rules"] if r["id"] != cgp_rule["id"]
+                    ]
+                    self.cache["rules"].append(updated)
+                except NotFoundException:
+                    silent_error(
+                        f"Rule {rule_name} ({cgp_rule['id']}) missing on Cloudflare "
+                        f"— evicting from cache and recreating"
+                    )
+                    self.cache["rules"] = [
+                        r for r in self.cache["rules"] if r["id"] != cgp_rule["id"]
+                    ]
+                    rule = create_rule(rule_name, list_ids, action=rule_action,
+                                       priority=rule_priority, filters=filters,
+                                       traffic_field=traffic_field)
+                    info(f"Recreated rule: {rule['name']}")
+                    self.cache["rules"].append(rule)
+            else:
+                silent_error(f"Skipping rule update (unchanged): {rule_name}")
+        else:
+            rule = create_rule(rule_name, list_ids, action=rule_action,
+                               priority=rule_priority, filters=filters,
+                               traffic_field=traffic_field)
+            info(f"Created rule: {rule['name']}")
+            self.cache["rules"].append(rule)
+
+        utils.save_cache(self.cache)
+
+    def _delete_rule_by_name(self, rule_name):
+        current_rules = utils.get_current_rules(self.cache, rule_name)
+        for rule in current_rules:
+            try:
+                delete_rule(rule["id"])
+                info(f"Deleted rule: {rule['name']}")
+            except NotFoundException:
+                silent_error(f"Rule {rule['name']} already gone on Cloudflare — skipping")
+            self.cache["rules"] = [r for r in self.cache["rules"] if r["id"] != rule["id"]]
+            utils.save_cache(self.cache)
+
+    def _sync_lists(self, domains, list_name_prefix, rule_name, rule_action, rule_priority,
+                     sni_rule_name=None):
+        current_lists = utils.get_current_lists(self.cache, list_name_prefix)
 
         list_id_to_domains = {}
         for lst in current_lists:
@@ -106,41 +159,19 @@ class CloudflareManager:
                     self.cache["mapping"][lst["id"]] = new_items
                     new_list_ids.append(lst["id"])
 
-        # Sync rule
-        cgp_rule = next(
-            (r for r in current_rules if r["name"] == rule_name), None
-        )
-        cgp_list_ids = utils.extract_list_ids(cgp_rule)
+        # Sync the DNS rule
+        self._sync_rule(new_list_ids, rule_name, rule_action, rule_priority)
 
-        if cgp_rule:
-            if set(new_list_ids) != cgp_list_ids:
-                try:
-                    updated = update_rule(rule_name, cgp_rule["id"], new_list_ids,
-                                          action=rule_action, priority=rule_priority)
-                    info(f"Updated rule: {updated['name']}")
-                    self.cache["rules"] = [
-                        r for r in self.cache["rules"] if r["id"] != cgp_rule["id"]
-                    ]
-                    self.cache["rules"].append(updated)
-                except NotFoundException:
-                    silent_error(
-                        f"Rule {rule_name} ({cgp_rule['id']}) missing on Cloudflare "
-                        f"— evicting from cache and recreating"
-                    )
-                    self.cache["rules"] = [
-                        r for r in self.cache["rules"] if r["id"] != cgp_rule["id"]
-                    ]
-                    rule = create_rule(rule_name, new_list_ids,
-                                       action=rule_action, priority=rule_priority)
-                    info(f"Recreated rule: {rule['name']}")
-                    self.cache["rules"].append(rule)
-            else:
-                silent_error(f"Skipping rule update (unchanged): {rule_name}")
-        else:
-            rule = create_rule(rule_name, new_list_ids,
-                               action=rule_action, priority=rule_priority)
-            info(f"Created rule: {rule['name']}")
-            self.cache["rules"].append(rule)
+        # Optional companion Network (L4) rule: blocks by TLS SNI instead of
+        # DNS resolution. Reuses the same domain lists — Cloudflare Zero
+        # Trust lists of type DOMAIN can be referenced from either a DNS
+        # rule (dns.domains) or a Network rule (net.sni.domains). Only takes
+        # effect for devices connected via WARP with the TCP proxy enabled.
+        if sni_rule_name:
+            self._sync_rule(
+                new_list_ids, sni_rule_name, rule_action, rule_priority,
+                filters=["l4"], traffic_field="net.sni.domains",
+            )
 
         utils.save_cache(self.cache)
         return len(new_list_ids)
@@ -206,6 +237,7 @@ class CloudflareManager:
             self.block_rule_name,
             rule_action="block",
             rule_priority=1000,
+            sni_rule_name=self.block_sni_rule_name if ENABLE_SNI_FILTER else None,
         )
 
         info("=== Syncing ALLOW lists & rule ===")
@@ -221,6 +253,7 @@ class CloudflareManager:
 
     def delete_resources(self):
         info("=== Deleting BLOCK resources ===")
+        self._delete_rule_by_name(self.block_sni_rule_name)
         self._delete_by_prefix(self.block_list_name, self.block_rule_name)
         info("=== Deleting ALLOW resources ===")
         self._delete_by_prefix(self.allow_list_name, self.allow_rule_name)
