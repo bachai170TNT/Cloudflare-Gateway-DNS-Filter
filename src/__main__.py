@@ -169,7 +169,7 @@ class CloudflareManager:
         # effect for devices connected via WARP with the TCP proxy enabled.
         if sni_rule_name:
             self._sync_rule(
-                new_list_ids, sni_rule_name, rule_action, rule_priority,
+                new_list_ids, sni_rule_name, rule_action, rule_priority + 1,
                 filters=["l4"], traffic_field="net.sni.domains",
             )
 
